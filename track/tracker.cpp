@@ -1,14 +1,31 @@
 #include <iostream>
 #include <windows.h>
+#include <vector>
+#include <algorithm>
 #include <string>
+#include <cstring>
+#include <unordered_set>
+#include <unordered_map>
+#include <time>
 #include <ctime>
+#include <tlhelp32.h>
 #include "sqlite3.h"
 
 using namespace std;
-int callback(void* data, int argc, char** argv, char** azColName);
+int callback(void *data, int argc, char **argv, char **azColName);
 int main()
 {
 
+    vector<string> ignoredProcesses = {
+        "svchost.exe",
+        "services.exe",
+        "lsass.exe",
+        "wininit.exe",
+        "csrss.exe",
+        "smss.exe"};
+
+    unordered_map<DWORD, string> CurrentProcess;
+    unordered_map<DWORD, string> PreviousProcess;
     // CONNNECTING DATABASE(SQLLITE)
     sqlite3 *tracetime;
     int dbcont = sqlite3_open("tracetime.db", &tracetime);
@@ -19,27 +36,99 @@ int main()
         const string sql = R"(CREATE TABLE IF NOT EXISTS usage_sessions (
 id INTEGER PRIMARY KEY AUTOINCREMENT,
 app_name TEXT NOT NULL,
+process_id INTEGER NOT NULL,
 start_time INTEGER NOT NULL,
 end_time INTEGER,
 duration INTEGER
 );
 
 )";
-        char* errMsg = nullptr;
-        sqlite3_exec(tracetime,sql.c_str(),nullptr,nullptr,&errMsg);
+        char *errMsg = nullptr;
+        sqlite3_exec(tracetime, sql.c_str(), nullptr, nullptr, &errMsg);
         HWND temp;
         DWORD temp2;
         char processPath[1024];
         char previousPath[1024] = "";
         char *result;
-        // debuging wheter 
+        // debuging wheter
         const string testquery = R"(SELECT name FROM sqlite_master WHERE type = 'table';)";
-        sqlite3_exec(tracetime,testquery.c_str(),callback,nullptr,&errMsg);
-        sqlite3_close(tracetime);
-        // CHECKING WHICH PROCESS IS CURRENTLY RUNNING
+        sqlite3_exec(tracetime, testquery.c_str(), callback, nullptr, &errMsg);
+        // getting foreground process
         while (true)
         {
             time_t current_dt = time(0);
+            HANDLE proce = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            PROCESSENTRY32 pe;
+            pe.dwSize = sizeof(PROCESSENTRY32);
+            if (proce == INVALID_HANDLE_VALUE)
+                cout << "FAILED TO GET THE PROCESS";
+            else
+            {
+
+                if (Process32First(proce, &pe))
+                {
+                    CurrentProcess.clear();
+                    do
+                    {
+                        string exefilename(pe.szExeFile);
+                        if (find(ignoredProcesses.begin(), ignoredProcesses.end(), exefilename) == ignoredProcesses.end())
+                        {
+                            // filling the currentprocess set with the process
+                            CurrentProcess[pe.th32ProcessID] = exefilename;
+                        }
+                    } while (Process32Next(proce, &pe));
+                }
+                CloseHandle(proce);
+            }
+
+            // comparing previous and current process;
+            for (const auto &procce : PreviousProcess)
+            {
+                // EXITED PROCESS
+                if (CurrentProcess.find(procce.first) == CurrentProcess.end())
+                {
+                    // procce.first  = PID
+                    // procce.second = app name
+                    time_t endtime = time(nullptr);
+                    const string updatesqlquery = R"(UPDATE usage_sessions
+                    SET end_time = ?,
+                    duration = ? - start_time
+                    WHERE process_id = ?
+                    AND end_time IS NULL;)";
+
+                    sqlite3_stmt *stmt;
+                    if (sqlite3_prepare_v2(tracetime, updatesqlquery.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
+                    {
+                        sqlite3_bind_int64(stmt, 1, endtime);
+                        sqlite3_bind_int64(stmt, 2, endtime);
+                        sqlite3_bind_int64(stmt, 3, procce.first);
+                        sqlite3_step(stmt);
+                        sqlite3_finalize(stmt);
+                    }
+                }
+            }
+            for (const auto &procce : CurrentProcess)
+            {
+                // NEW PROCESS
+                if (PreviousProcess.find(procce.first) == PreviousProcess.end())
+                {
+                    time_t currenttime = time(nullptr);
+                    const string addsqlquery = R"(INSERT INTO usage_sessions(app_name,process_id,start_time)
+                    VALUES(?,?,?))";
+                    sqlite3_stmt *smt;
+                    if (sqlite3_prepare_v2(tracetime, addsqlquery.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
+                    {
+                        sqlite3_bind_text(stmt, 1, procce.second.c_str(),-1,SQLITE_TRANSIENT);
+                        sqlite3_bind_int64(stmt, 2, procce.first);
+                        sqlite3_bind_int64(stmt, 3, currenttime);
+                        sqlite3_step(stmt);
+                        sqlite3_finalize(stmt);
+                    }
+                }
+            }
+            PreviousProcess = CurrentProcess;
+
+            // CHECKING WHICH PROCESS IS CURRENTLY RUNNING
             // GETTING CURRENT TIME
             result = ctime(&current_dt);
             temp = GetForegroundWindow();
@@ -63,14 +152,17 @@ duration INTEGER
             }
             Sleep(1000);
         }
+        sqlite3_close(tracetime);
     }
     else
         cout << sqlite3_errmsg(tracetime);
     return 0;
 }
 
-int callback(void* data, int argc, char** argv, char** azColName){
-    for(int i = 0 ; i < argc ; i++){
+int callback(void *data, int argc, char **argv, char **azColName)
+{
+    for (int i = 0; i < argc; i++)
+    {
         cout << azColName[i] << " || " << argv[i] << '\n';
     }
     return 0;
