@@ -6,15 +6,67 @@
 #include <cstring>
 #include <unordered_set>
 #include <unordered_map>
-#include <time>
+// #include <time>
 #include <ctime>
+#include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <functional>
+#include <atomic>
+#include <chrono>
 #include <tlhelp32.h>
 #include "sqlite3.h"
 
 using namespace std;
+
+// MAINTAINNG CURRENT TIME IN A DB FOR RESCUE
+void updateTrackerTime(atomic<bool> &running,mutex& timerMutex,condition_variable& timerCV)
+{
+    sqlite3 *timeDB = nullptr;
+    if (sqlite3_open("tracetime.db", &timeDB) != SQLITE_OK)
+    {
+        cerr << "TimeStamo DB connection failed\n";
+        return;
+    }
+    sqlite3_busy_timeout(timeDB,3000)
+    sqlite3_stmt *stmt = nullptr;
+
+    const string upSeenQuery = "UPDATE tracker_state SET last_active_time = ? WHERE id = 1;";
+    if (sqlite3_prepare_v2(timeDB, upSeenQuery.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    {
+        cerr << "TimeStamp prepare failed: " << sqlite3_errmsg(timeDB) << '\n';
+        sqlite3_close(timeDB);
+        return;
+    }
+    while(running.load()){
+        time_t currenttime = time(nullptr);
+        sqlite3_bind_int64(stmt,1,currenttime);
+        int rc = sqlite3_step(stmt);
+        if(rc != SQLITE_OK){
+            cerr << "Timestamp update failed: " << sqlite3_errmsg(timeDB) << '\n';
+        }
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+
+        unique_lock<mutex> lock(timerMutex);
+
+
+        timerCV.wait_for(lock,chrono::seconds(1),[&running](){return !running.load();});
+
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(timeDB);
+}
+
+
+
 int callback(void *data, int argc, char **argv, char **azColName);
 int main()
 {
+    atomic<bool> running(true);
+    mutex timerMutex;
+    condition_variable timerCV;
+    thread timerThread(updateTrackerTime,ref(running),ref(timerMutex),ref(timerCV));
 
     vector<string> ignoredProcesses = {
         "svchost.exe",
@@ -53,9 +105,15 @@ duration INTEGER
         // debuging wheter
         const string testquery = R"(SELECT name FROM sqlite_master WHERE type = 'table';)";
         sqlite3_exec(tracetime, testquery.c_str(), callback, nullptr, &errMsg);
+        // creating a db for storing time
+        const string timequery = R"(CREATE TABLE IF NOT EXISTS tracker_state(
+        id INTEGER PRIMARy KEY CHECK(id = 1),
+        last_active_time INTEGER NOT NULL
+        );)";
         // getting foreground process
         while (true)
         {
+            // cout << "\n========== NEW SCAN ==========\n";
             time_t current_dt = time(0);
             HANDLE proce = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             PROCESSENTRY32 pe;
@@ -80,13 +138,52 @@ duration INTEGER
                 }
                 CloseHandle(proce);
             }
+            // ------debug for testing-----------
+            // cout << "\n========== CURRENT PROCESSES ==========\n";
+
+            // for (const auto &proc : CurrentProcess)
+            // {
+            //     cout << "PID: " << proc.first
+            //          << " | APP: " << proc.second << '\n';
+            // }
 
             // comparing previous and current process;
+            for (const auto &procce : CurrentProcess)
+            {
+                auto prev = PreviousProcess.find(procce.first);
+                // NEW PROCESS
+                if (prev == PreviousProcess.end())
+                {
+                    // debug line for testing -----------------------
+                    // cout << "[NEW PROCESS]" << procce.second << " | PID :" << procce.first << '\n';
+
+                    time_t currenttime = time(nullptr);
+                    const string addsqlquery = R"(INSERT INTO usage_sessions(app_name,process_id,start_time)
+                    VALUES(?,?,?))";
+                    sqlite3_stmt *stmt;
+                    int rc = sqlite3_prepare_v2(tracetime, addsqlquery.c_str(), -1, &stmt, nullptr);
+                    if (rc == SQLITE_OK)
+                    {
+
+                        sqlite3_bind_text(stmt, 1, procce.second.c_str(), -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_int64(stmt, 2, procce.first);
+                        sqlite3_bind_int64(stmt, 3, currenttime);
+
+                        sqlite3_step(stmt);
+                        sqlite3_finalize(stmt);
+                    }
+                }
+                else if (prev->second != procce.second)
+                {
+                }
+            }
             for (const auto &procce : PreviousProcess)
             {
                 // EXITED PROCESS
                 if (CurrentProcess.find(procce.first) == CurrentProcess.end())
                 {
+                    // debug testing have to remove later --------------------------
+                    // cout<< "[eXIteD process]" << procce.second << " | PID:" << procce.first << '\n';
                     // procce.first  = PID
                     // procce.second = app name
                     time_t endtime = time(nullptr);
@@ -106,50 +203,38 @@ duration INTEGER
                         sqlite3_finalize(stmt);
                     }
                 }
-            }
-            for (const auto &procce : CurrentProcess)
-            {
-                // NEW PROCESS
-                if (PreviousProcess.find(procce.first) == PreviousProcess.end())
+                else
                 {
-                    time_t currenttime = time(nullptr);
-                    const string addsqlquery = R"(INSERT INTO usage_sessions(app_name,process_id,start_time)
-                    VALUES(?,?,?))";
-                    sqlite3_stmt *smt;
-                    if (sqlite3_prepare_v2(tracetime, addsqlquery.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
-                    {
-                        sqlite3_bind_text(stmt, 1, procce.second.c_str(),-1,SQLITE_TRANSIENT);
-                        sqlite3_bind_int64(stmt, 2, procce.first);
-                        sqlite3_bind_int64(stmt, 3, currenttime);
-                        sqlite3_step(stmt);
-                        sqlite3_finalize(stmt);
-                    }
+                    // debug testing have to remove later --------------------------
+                    // cout << "[RUNNING]" << procce.second << " | PID:" <<  procce.first << '\n';
                 }
             }
+            // cout << "\n========== SCAN COMPLETE ==========\n";
             PreviousProcess = CurrentProcess;
 
             // CHECKING WHICH PROCESS IS CURRENTLY RUNNING
             // GETTING CURRENT TIME
-            result = ctime(&current_dt);
-            temp = GetForegroundWindow();
-            GetWindowThreadProcessId(temp, &temp2);
-            HANDLE temp3 = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, temp2);
-            if (temp3)
-            {
-                DWORD buff = 1024;
-                if (QueryFullProcessImageNameA(temp3, 0, processPath, &buff))
-                {
-                    if (strcmp(processPath, previousPath))
-                    {
-                        string str(processPath);
-                        int pos = str.find_last_of('\\');
-                        str = str.substr(pos + 1);
-                        cout << str << " " << result << '\n';
-                        strcpy(previousPath, processPath);
-                    }
-                }
-                CloseHandle(temp3);
-            }
+            // o-------------------------------------------------------------o
+            // result = ctime(&current_dt);
+            // temp = GetForegroundWindow();
+            // GetWindowThreadProcessId(temp, &temp2);
+            // HANDLE temp3 = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, temp2);
+            // if (temp3)
+            // {
+            //     DWORD buff = 1024;
+            //     if (QueryFullProcessImageNameA(temp3, 0, processPath, &buff))
+            //     {
+            //         if (strcmp(processPath, previousPath))
+            //         {
+            //             string str(processPath);
+            //             int pos = str.find_last_of('\\');
+            //             str = str.substr(pos + 1);
+            //             cout << str << " " << result << '\n';
+            //             strcpy(previousPath, processPath);
+            //         }
+            //     }
+            //     CloseHandle(temp3);
+            // }
             Sleep(1000);
         }
         sqlite3_close(tracetime);
