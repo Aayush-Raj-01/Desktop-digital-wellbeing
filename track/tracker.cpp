@@ -28,7 +28,7 @@ void updateTrackerTime(atomic<bool> &running,mutex& timerMutex,condition_variabl
         cerr << "TimeStamo DB connection failed\n";
         return;
     }
-    sqlite3_busy_timeout(timeDB,3000)
+    sqlite3_busy_timeout(timeDB,3000);
     sqlite3_stmt *stmt = nullptr;
 
     const string upSeenQuery = "UPDATE tracker_state SET last_active_time = ? WHERE id = 1;";
@@ -59,13 +59,55 @@ void updateTrackerTime(atomic<bool> &running,mutex& timerMutex,condition_variabl
 }
 
 
+// recovery  SYSTEM
+void recoveryPreviousSessions(sqlite3* tracetime){
+    const char* query = R"(
+    update usage_seesions
+    Set
+        end_time = (
+            SELECT last_active_time
+            FROM tracker_state
+            WHERE id = 1
+            ),
+            duration = MAX(0,(
+                SELECT last_active_time
+                FROM last_active_time
+                FROM tracker_state
+                WHERE id = 1
+                )-start_time),
+                is_active = 0
+            WHERE is_active = 1
+            AND EXISTS (
+                SELECT 1
+                FROM tracker_state
+                WHERE id = 1 AND last_active_time > 0
+                );
+            )";
+
+            char* errMsg = nullptr;
+
+            int rc = sqlite3_exec(tracetime,query,nullptr,nullptr,&errMsg);
+            if(rc != SQLITE_OK){
+                cerr << "Recovery failed: " << errMsg << '\n';
+                sqlite3_free(errMsg);
+                return;
+            }
+
+            cout << "Recovered Sessions: " << sqlite3_changes(tracetime) << '\n';
+
+}
 
 int callback(void *data, int argc, char **argv, char **azColName);
 int main()
 {
+    // Opening Database
+    int dbcont = sqlite3_open("tracetime.db", &tracetime);
     atomic<bool> running(true);
     mutex timerMutex;
     condition_variable timerCV;
+    // Calling recovery
+    recoveryPreviousSessions(tracetime);
+    // starting the timer
     thread timerThread(updateTrackerTime,ref(running),ref(timerMutex),ref(timerCV));
 
     vector<string> ignoredProcesses = {
@@ -80,7 +122,6 @@ int main()
     unordered_map<DWORD, string> PreviousProcess;
     // CONNNECTING DATABASE(SQLLITE)
     sqlite3 *tracetime;
-    int dbcont = sqlite3_open("tracetime.db", &tracetime);
     if (dbcont == SQLITE_OK)
     {
         // SQLLITE QUERY
