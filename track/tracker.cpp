@@ -171,7 +171,6 @@ void finalizeActiveSessions(sqlite3 *tracetime)
     }
 }
 
-
 int callback(void *data, int argc, char **argv, char **azColName);
 int main()
 {
@@ -188,32 +187,52 @@ int main()
     // starting the timer
     thread timerThread(updateTrackerTime, ref(running), ref(timerMutex), ref(timerCV));
 
-    vector<string> ignoredProcesses = {
-        "svchost.exe",
-        "services.exe",
-        "lsass.exe",
-        "wininit.exe",
-        "csrss.exe",
-        "smss.exe"};
-
-        // CONNNECTING DATABASE(SQLLITE)
-        if (dbcont == SQLITE_OK)
-        {
-            // SQLLITE QUERY
-            cout << "DATABASE CONNECTED SUCCESSFULLY\n";
-            const string sql = R"(CREATE TABLE IF NOT EXISTS usage_sessions (
+   vector<string> ignoredProcesses = {
+    "svchost.exe",
+    "services.exe",
+    "lsass.exe",
+    "wininit.exe",
+    "csrss.exe",
+    "smss.exe",
+    "sihost.exe",
+    "taskhostw.exe",
+    "RuntimeBroker.exe",
+    "backgroundTaskHost.exe",
+    "ShellExperienceHost.exe",
+    "StartMenuExperienceHost.exe",
+    "TextInputHost.exe",
+    "SearchHost.exe",
+    "LockApp.exe",
+    "audiodg.exe",
+    "ctfmon.exe",
+    "dllhost.exe",
+    "windhawk.exe",
+"msedgewebview2.exe",
+"NVIDIA Overlay.exe",
+"nvcontainer.exe",
+"RtkAudUService64.exe",
+"FnKey.exe",
+"ABDownloadManager.exe"
+};
+    // CONNNECTING DATABASE(SQLLITE)
+    if (dbcont == SQLITE_OK)
+    {
+        // SQLLITE QUERY
+        cout << "DATABASE CONNECTED SUCCESSFULLY\n";
+        const string sql = R"(CREATE TABLE IF NOT EXISTS usage_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 app_name TEXT NOT NULL,
 process_id INTEGER NOT NULL,
 start_time INTEGER NOT NULL,
 end_time INTEGER,
-duration INTEGER
+duration INTEGER,
+is_active INTEGER
 );
 
 )";
-char *errMsg = nullptr;
-sqlite3_exec(tracetime, sql.c_str(), nullptr, nullptr, &errMsg);
-HWND temp;
+        char *errMsg = nullptr;
+        sqlite3_exec(tracetime, sql.c_str(), nullptr, nullptr, &errMsg);
+        HWND temp;
         DWORD temp2;
         char processPath[1024];
         char previousPath[1024] = "";
@@ -226,24 +245,26 @@ HWND temp;
             id INTEGER PRIMARy KEY CHECK(id = 1),
             last_active_time INTEGER NOT NULL
             );)";
-            
-            // structure for saving the process
-            struct ProcessInfo{
-                string name;
-                FILETIME creationTime;
-            };
-            unordered_map<DWORD, ProcessInfo> CurrentProcess;
-            unordered_map<DWORD, ProcessInfo> PreviousProcess;
-            // getting foreground process
-            while (true)
-            {
+
+        // structure for saving the process
+        struct ProcessInfo
+        {
+            string name;
+            FILETIME creationTime;
+            DWORD parentPID;
+        };
+        unordered_map<DWORD, ProcessInfo> CurrentProcess;
+        unordered_map<DWORD, ProcessInfo> PreviousProcess;
+        // getting foreground process
+        while (true)
+        {
             // cout << "\n========== NEW SCAN ==========\n";
             time_t current_dt = time(0);
             HANDLE proce = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             PROCESSENTRY32 pe;
             pe.dwSize = sizeof(PROCESSENTRY32);
             if (proce == INVALID_HANDLE_VALUE)
-            cout << "FAILED TO GET THE PROCESS";
+                cout << "FAILED TO GET THE PROCESS";
             else
             {
 
@@ -259,34 +280,35 @@ HWND temp;
                             HANDLE hProcess = OpenProcess(
                                 PROCESS_QUERY_LIMITED_INFORMATION,
                                 FALSE,
-                                pe.cntUsage
-                            );
-                            if(hProcess != nullptr){
-                                FILETIME creationTime , exitTime, kernelTime , userTime;
-                                if(GetProcessTimes(hProcess,&creationTime,&exitTime,&kernelTime,&userTime)){
+                                pe.th32ProcessID);
+                            if (hProcess != nullptr)
+                            {
+                                FILETIME creationTime, exitTime, kernelTime, userTime;
+                                if (GetProcessTimes(hProcess, &creationTime, &exitTime, &kernelTime, &userTime))
+                                {
                                     CurrentProcess[pe.th32ProcessID] = {
                                         exefilename,
-                                        creationTime
-                                    };
+                                        creationTime};
                                 }
                                 CloseHandle(hProcess);
                             }
                         }
-                    
+
                     } while (Process32Next(proce, &pe));
                 }
                 CloseHandle(proce);
             }
+
             // ------debug for testing-----------
             // cout << "\n========== CURRENT PROCESSES ==========\n";
 
             // for (const auto &proc : CurrentProcess)
             // {
-                //     cout << "PID: " << proc.first
-                //          << " | APP: " << proc.second << '\n';
-                // }
-                
-                // comparing previous and current process;
+            //     cout << "PID: " << proc.first
+            //          << " | APP: " << proc.second << '\n';
+            // }
+
+            // comparing previous and current process;
             for (const auto &procce : CurrentProcess)
             {
                 auto prev = PreviousProcess.find(procce.first);
@@ -294,7 +316,7 @@ HWND temp;
                 if (prev == PreviousProcess.end())
                 {
                     // debug line for testing -----------------------
-                    // cout << "[NEW PROCESS]" << procce.second << " | PID :" << procce.first << '\n';
+                    // cout << "[NEW PROCESS]" << procce.second.name << " | PID :" << procce.first << '\n';
 
                     time_t currenttime = time(nullptr);
                     const string addsqlquery = R"(INSERT INTO usage_sessions(app_name,process_id,start_time,is_active)
@@ -326,33 +348,35 @@ HWND temp;
                     AND is_active = 1;
                 )";
 
-                sqlite3_stmt* stmt;
-                if(sqlite3_prepare_v2(tracetime,closeQuery.c_str(),-1,&stmt,nullptr) == SQLITE_OK){
-                    sqlite3_bind_int(stmt,1,endtime);
-                    sqlite3_bind_int64(stmt,2,endtime);
-                    sqlite3_bind_int64(stmt,3,procce.first);
+                    sqlite3_stmt *stmt;
+                    if (sqlite3_prepare_v2(tracetime, closeQuery.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
+                    {
+                        sqlite3_bind_int64(stmt, 1, endtime);
+                        sqlite3_bind_int64(stmt, 2, endtime);
+                        sqlite3_bind_int64(stmt, 3, procce.first);
 
-                    sqlite3_step(stmt);
-                    sqlite3_finalize(stmt);
-                }
-                // add new preocess
+                        sqlite3_step(stmt);
+                        sqlite3_finalize(stmt);
+                    }
+                    // add new preocess
 
-                time_t startTime = time(nullptr);
+                    time_t startTime = time(nullptr);
 
-                const string insertQuery = R"(
+                    const string insertQuery = R"(
                 INSERT INTO usage_sessions(app_name,process_id,start_time,is_active)
                 VALUES(?,?,?,1);
                 )";
 
+                    sqlite3_stmt *insertStmt;
 
-                sqlite3_stmt* insertStmt;
-
-                if(sqlite3_prepare_v2(tracetime,insertQuery.c_str(),-1,&insertStmt,nullptr) == SQLITE_OK){
-                    sqlite3_bind_text(insertStmt,1,procce.second.name.c_str(),-1,SQLITE_TRANSIENT);
-                    sqlite3_bind_int64(insertStmt,2,procce.first);  
-                    sqlite3_bind_int64(insertStmt,3,startTime);  
-                }
-
+                    if (sqlite3_prepare_v2(tracetime, insertQuery.c_str(), -1, &insertStmt, nullptr) == SQLITE_OK)
+                    {
+                        sqlite3_bind_text(insertStmt, 1, procce.second.name.c_str(), -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_int64(insertStmt, 2, procce.first);
+                        sqlite3_bind_int64(insertStmt, 3, startTime);
+                    }
+                    sqlite3_step(insertStmt);
+                    sqlite3_finalize(insertStmt);
                 }
             }
             for (const auto &procce : PreviousProcess)
@@ -367,9 +391,10 @@ HWND temp;
                     time_t endtime = time(nullptr);
                     const string updatesqlquery = R"(UPDATE usage_sessions
                     SET end_time = ?,
-                    duration = ? - start_time
+                    duration = (0,? - start_time),
+                    is_active = 0
                     WHERE process_id = ?
-                    AND end_time IS NULL;)";
+                    AND is_active = 1;)";
 
                     sqlite3_stmt *stmt;
                     if (sqlite3_prepare_v2(tracetime, updatesqlquery.c_str(), -1, &stmt, nullptr) == SQLITE_OK)
